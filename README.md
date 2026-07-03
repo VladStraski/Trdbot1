@@ -15,7 +15,7 @@
 | 3 | **Order Book Module** (OBI, стены, спред, CVD; WS + офлайн-реплей) | ✅ реализован |
 | 4 | **Strategy Module** (confluence-скоринг, сигналы в лог; Market Context) | ✅ реализован |
 | 5 | **Backtester** (та же Strategy; издержки, look-ahead-защита, метрики) | ✅ реализован |
-| 6 | Risk Manager | ⏳ |
+| 6 | **Risk Manager** (sizing, плечо от liq-safety, стоп/тейк, издержки в R:R) | ✅ реализован |
 | 7 | Execution Engine | ⏳ |
 | 8 | Position Manager + синхронизация | ⏳ |
 | 9 | Portfolio limits / kill switch | ⏳ |
@@ -116,6 +116,19 @@ python -m trading_bot.main stage5 --limit 800   # по живым klines
 Движок работает на плоских `Bar`+`FeatureSnapshot` (stdlib); стоп/размер вынесены
 в инъектируемые функции (`default_sl_tp`/`default_sizing`) — на Этапе 6 их
 заменяет Risk Manager без переписывания движка.
+
+## Запуск — Этап 6 (Risk Manager)
+
+Единое риск-решение по сделке (раздел 7 ТЗ): fixed-fractional sizing, стоп по
+ATR/swing, плечо от безопасности ликвидации (дистанция до ликвидации ≥ 3×
+дистанции стопа, потолок 5x), тейк с поправкой на издержки (R:R после комиссий и
+funding ≥ min_rr). Те же адаптеры (`as_sl_tp_fn`/`as_sizing_fn`) подключаются в
+бэктест Этапа 5 — логика риска одна для live и истории.
+
+```bash
+python -m trading_bot.main stage6 --offline   # риск-решения + бэктест через RM
+python -m trading_bot.main stage6 --limit 800 # решение по живому equity/сигналу
+```
 
 > **Опциональные зависимости.** `config/settings.py` и CLI написаны так, что
 > `stage3`/`stage4 --offline` работают без установленных `pandas`/`pybit`/

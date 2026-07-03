@@ -495,6 +495,84 @@ def _synthetic_backtest_series(FeatureSnapshot, Bar):
     return series
 
 
+def stage6_risk(offline: bool = False, klines_limit: int = 800) -> int:
+    """Этап 6: Risk Manager — sizing, стоп/тейк, плечо, издержки в R:R.
+
+    offline=True — демонстрация риск-решений на сценариях + бэктест Этапа 5 через
+    адаптеры Risk Manager (та же логика риска, что и live). Без сети/pandas.
+    offline=False — риск-решение по последнему сигналу на живом equity.
+    """
+    from .risk.risk_manager import RiskManager, RiskParams
+    from .strategy.model import LONG, SHORT
+
+    settings = load_settings()
+    setup_logging(settings.log_dir, settings.log_level)
+    params = RiskParams.from_settings(settings)
+    rm = RiskManager(params)
+    mode = "OFFLINE (сценарии)" if offline else "LIVE (equity Bybit)"
+    log.info("=== Этап 6: Risk Manager [%s] risk_pct=%.2f%% cap=%dx ===",
+             mode, params.risk_pct * 100, params.leverage_hard_cap)
+
+    if offline:
+        equity = 10_000.0
+        cases = [
+            ("лонг, ATR=150, swing_low=29500", LONG, 30_000.0, 150.0, 29_500.0, None),
+            ("шорт, ATR=150, swing_high=30500", SHORT, 30_000.0, 150.0, None, 30_500.0),
+            ("лонг, нулевой equity -> отказ", LONG, 30_000.0, 150.0, None, None, 0.0),
+        ]
+        approved = 0
+        for name, direction, entry, atr, sl, sh, *eq in cases:
+            e = eq[0] if eq else equity
+            d = rm.decide(direction, entry, atr, e, swing_low=sl, swing_high=sh)
+            log.info("[%s] approved=%s qty=%.4f stop=%.2f take=%.2f плечо=%dx "
+                     "риск=%.2f netRR=%.2f | %s",
+                     name, d.approved, d.qty, d.stop, d.take, d.leverage,
+                     d.risk_amount, d.net_rr, d.reason)
+            approved += int(d.approved)
+
+        # Бэктест через адаптеры Risk Manager.
+        from .backtest.engine import Backtester, BacktestConfig, Bar
+        from .strategy.base_strategy import BaseStrategy
+        from .strategy.model import FeatureSnapshot
+        bt = Backtester(BaseStrategy(), BacktestConfig(risk_pct=params.risk_pct),
+                        sl_tp_fn=rm.as_sl_tp_fn(), sizing_fn=rm.as_sizing_fn())
+        res = bt.run(_synthetic_backtest_series(FeatureSnapshot, Bar))
+        s = res.summary()
+        log.info("Бэктест через Risk Manager: сделок=%d winrate=%.0f%% PnL=%.2f",
+                 s["trades"], s["win_rate"] * 100, s["net_pnl"])
+        log.info("=== Этап 6 (offline): %d/%d решений одобрено ✔ ===",
+                 approved, len(cases))
+        return 0 if approved == 2 else 1
+
+    # --- LIVE ---
+    from .execution.bybit_client import BybitClient
+    from .indicators.engine import IndicatorConfig, IndicatorEngine
+    from .strategy.base_strategy import BaseStrategy
+    from .strategy.model import ScoreConfig
+
+    client = BybitClient(settings)
+    equity = client.get_equity(coin="USDT")
+    log.info("Живой equity: %.2f USDT", equity)
+    agg = _populate_aggregator(settings, klines_limit, offline=False)
+    if agg is None:
+        return 1
+    strategy = BaseStrategy(ScoreConfig(entry_threshold=settings.entry_score_threshold))
+    engine = IndicatorEngine(IndicatorConfig())
+    last = agg.latest(settings.tf_trigger, 1)
+    ref_time = int(last.iloc[0]["close_time"])
+    feat = strategy.extract_features(agg, engine, ref_time, settings.tf_context,
+                                     settings.tf_signal, settings.tf_trigger)
+    sig = strategy.evaluate(feat) if feat else None
+    if sig and sig.entered and sig.direction:
+        d = rm.decide(sig.direction, feat.price, feat.atr, equity,
+                      swing_low=feat.swing_low_price, swing_high=feat.swing_high_price)
+        log.info("Риск-решение: %s", d)
+    else:
+        log.info("Нет сигнала на вход — риск-решение не требуется")
+    log.info("=== Этап 6 (live) завершён ✔ ===")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trading Bot CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -542,6 +620,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Сколько свечей грузить на каждый TF (live)")
     p5.add_argument("--stoch-rsi", action="store_true",
                     help="Использовать Stoch RSI вместо RSI")
+
+    p6 = sub.add_parser("stage6", help="Risk Manager (sizing, стоп/тейк, плечо)")
+    p6.add_argument("--offline", action="store_true",
+                    help="Демонстрация риск-решений без сети")
+    p6.add_argument("--limit", type=int, default=800,
+                    help="Сколько свечей грузить (live)")
     return parser
 
 
@@ -569,6 +653,8 @@ def main(argv: list[str] | None = None) -> int:
         return stage5_backtest(offline=args.offline,
                                klines_limit=args.limit,
                                use_stoch_rsi=args.stoch_rsi)
+    if args.command == "stage6":
+        return stage6_risk(offline=args.offline, klines_limit=args.limit)
     return 2
 
 
