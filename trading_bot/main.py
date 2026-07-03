@@ -16,10 +16,11 @@ import time
 
 import pandas as pd
 
-from .config.settings import TF_MS, load_settings
+from .config.settings import TF_MS, Settings, load_settings
 from .data.klines import fetch_klines
 from .data.multi_tf_aggregator import MultiTFAggregator
 from .execution.bybit_client import BybitClient
+from .indicators.engine import IndicatorConfig, IndicatorEngine
 from .logger import get_logger, setup_logging
 from .storage.models import Storage
 
@@ -47,20 +48,14 @@ def _synthetic_klines(tf: str, n: int, end_ms: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def stage1_healthcheck(request_demo_funds: bool = False, klines_limit: int = 300,
-                       offline: bool = False) -> int:
-    """Этап 1: подключение, klines, multi-TF агрегатор, проверка выравнивания.
+def _populate_aggregator(settings: Settings, klines_limit: int, offline: bool,
+                         request_demo_funds: bool = False,
+                         check_account: bool = False) -> MultiTFAggregator | None:
+    """Создать и наполнить multi-TF агрегатор (live или offline).
 
-    offline=True — прогон на синтетических данных без сети (для окружений, где
-    доступ к api.bybit.com закрыт сетевой политикой). Проверяет всю логику
-    seed + выравнивания без look-ahead, минуя REST.
+    Возвращает готовый агрегатор либо None при неустранимой ошибке.
+    Общий код для stage1/stage2.
     """
-    settings = load_settings()
-    setup_logging(settings.log_dir, settings.log_level)
-    mode = "OFFLINE (синтетика)" if offline else "LIVE (Bybit REST)"
-    log.info("=== Этап 1: Data Layer health-check [%s] ===", mode)
-    log.info("Конфигурация: %s", settings.redacted())
-
     tfs = [settings.tf_context, settings.tf_signal, settings.tf_trigger]
     agg = MultiTFAggregator(timeframes=tfs)
     now = _now_ms()
@@ -68,18 +63,16 @@ def stage1_healthcheck(request_demo_funds: bool = False, klines_limit: int = 300
     if offline:
         for tf in tfs:
             agg.seed(tf, _synthetic_klines(tf, klines_limit, now))
-    else:
-        client = BybitClient(settings)
+        return agg
 
-        # 1) Доступность API (публичный эндпоинт, работает без ключей).
-        if not client.ping():
-            log.error("Bybit API недоступен — проверьте сеть/прокси. "
-                      "Если домен bybit заблокирован политикой окружения, "
-                      "используйте офлайн-прогон: python -m trading_bot.main stage1 --offline")
-            return 1
-        log.info("API доступен ✔")
+    client = BybitClient(settings)
+    if not client.ping():
+        log.error("Bybit API недоступен — проверьте сеть/прокси. Если домен "
+                  "bybit заблокирован политикой окружения, используйте --offline")
+        return None
+    log.info("API доступен ✔")
 
-        # 2) Баланс / equity (требует ключей). Без ключей — пропускаем, не падаем.
+    if check_account:
         if settings.api_key and settings.api_secret:
             if request_demo_funds and settings.is_demo:
                 try:
@@ -98,14 +91,34 @@ def stage1_healthcheck(request_demo_funds: bool = False, klines_limit: int = 300
             log.warning("API-ключи не заданы — шаги с аккаунтом пропущены "
                         "(klines и агрегатор работают на публичных данных)")
 
-        # 3) klines по трём таймфреймам -> агрегатор.
-        for tf in tfs:
-            df = fetch_klines(client, tf, limit=klines_limit,
-                              only_closed=True, now_ms=now)
-            if df.empty:
-                log.error("Пустые klines для TF=%s", tf)
-                return 1
-            agg.seed(tf, df)
+    for tf in tfs:
+        df = fetch_klines(client, tf, limit=klines_limit, only_closed=True, now_ms=now)
+        if df.empty:
+            log.error("Пустые klines для TF=%s", tf)
+            return None
+        agg.seed(tf, df)
+    return agg
+
+
+def stage1_healthcheck(request_demo_funds: bool = False, klines_limit: int = 300,
+                       offline: bool = False) -> int:
+    """Этап 1: подключение, klines, multi-TF агрегатор, проверка выравнивания.
+
+    offline=True — прогон на синтетических данных без сети (для окружений, где
+    доступ к api.bybit.com закрыт сетевой политикой). Проверяет всю логику
+    seed + выравнивания без look-ahead, минуя REST.
+    """
+    settings = load_settings()
+    setup_logging(settings.log_dir, settings.log_level)
+    mode = "OFFLINE (синтетика)" if offline else "LIVE (Bybit REST)"
+    log.info("=== Этап 1: Data Layer health-check [%s] ===", mode)
+    log.info("Конфигурация: %s", settings.redacted())
+
+    agg = _populate_aggregator(settings, klines_limit, offline,
+                               request_demo_funds=request_demo_funds,
+                               check_account=True)
+    if agg is None:
+        return 1
 
     # 4) Проверка выравнивания без look-ahead: для последней закрытой свечи
     #    триггерного TF берём контекстную свечу и убеждаемся, что она закрылась
@@ -130,6 +143,46 @@ def stage1_healthcheck(request_demo_funds: bool = False, klines_limit: int = 300
     return 0
 
 
+def stage2_indicators(klines_limit: int = 300, offline: bool = False,
+                      use_stoch_rsi: bool = False) -> int:
+    """Этап 2: расчёт индикаторов на исторических данных сигнального TF (1h)
+    и снапшот последних значений (замена «проверки на графике» в CLI)."""
+    settings = load_settings()
+    setup_logging(settings.log_dir, settings.log_level)
+    mode = "OFFLINE (синтетика)" if offline else "LIVE (Bybit REST)"
+    log.info("=== Этап 2: Indicator Engine [%s] ===", mode)
+
+    agg = _populate_aggregator(settings, klines_limit, offline)
+    if agg is None:
+        return 1
+
+    cfg = IndicatorConfig(use_stoch_rsi=use_stoch_rsi)
+    engine = IndicatorEngine(cfg)
+
+    for tf in (settings.tf_context, settings.tf_signal, settings.tf_trigger):
+        frame = agg.frame(tf)
+        enriched = engine.compute(frame)
+        last = enriched.iloc[-1]
+        osc = (f"stochK={last.get('stochrsi_k'):.1f}" if use_stoch_rsi
+               else f"rsi={last.get('rsi'):.1f}")
+        log.info(
+            "[%s] close=%.2f ema%d=%.2f ema%d=%.2f adx=%.1f %s "
+            "macd_hist=%.4f atr=%.2f bb_bw=%.4f",
+            tf, last["close"], cfg.ema_fast, last[f"ema_{cfg.ema_fast}"],
+            cfg.ema_slow, last[f"ema_{cfg.ema_slow}"], last["adx"], osc,
+            last["macd_hist"], last["atr"], last["bb_bandwidth"],
+        )
+        # Санити-проверки: индикаторы посчитаны, без NaN на последнем баре.
+        for col in ("adx", "atr", "macd_hist", f"ema_{cfg.ema_slow}"):
+            if pd.isna(last[col]):
+                log.error("NaN в %s на последнем баре TF=%s "
+                          "(недостаточно истории для %s?)", col, tf, col)
+                return 1
+
+    log.info("=== Этап 2 завершён успешно ✔ ===")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trading Bot CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -141,6 +194,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Сколько свечей грузить на каждый TF")
     p1.add_argument("--offline", action="store_true",
                     help="Прогон на синтетических данных без сети")
+
+    p2 = sub.add_parser("stage2", help="Расчёт индикаторов (Indicator Engine)")
+    p2.add_argument("--limit", type=int, default=300,
+                    help="Сколько свечей грузить на каждый TF")
+    p2.add_argument("--offline", action="store_true",
+                    help="Прогон на синтетических данных без сети")
+    p2.add_argument("--stoch-rsi", action="store_true",
+                    help="Использовать Stoch RSI вместо RSI")
     return parser
 
 
@@ -150,6 +211,10 @@ def main(argv: list[str] | None = None) -> int:
         return stage1_healthcheck(request_demo_funds=args.demo_funds,
                                   klines_limit=args.limit,
                                   offline=args.offline)
+    if args.command == "stage2":
+        return stage2_indicators(klines_limit=args.limit,
+                                 offline=args.offline,
+                                 use_stoch_rsi=args.stoch_rsi)
     return 2
 
 

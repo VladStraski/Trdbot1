@@ -11,7 +11,7 @@
 | Этап | Модуль | Статус |
 |---|---|---|
 | 1 | **Data Layer** (Bybit-клиент, klines, multi-TF агрегатор, storage) | ✅ реализован |
-| 2 | Indicator Engine | ⏳ |
+| 2 | **Indicator Engine** (ADX, EMA, RSI/StochRSI, MACD, ATR, BB, OBV, VWAP, свечи, свинги) | ✅ реализован |
 | 3 | Order Book Module | ⏳ |
 | 4 | Strategy Module (confluence) | ⏳ |
 | 5 | Backtester | ⏳ |
@@ -31,8 +31,9 @@ cp trading_bot/config/.env.example trading_bot/config/.env
 ```
 
 > **Python 3.11 vs 3.12.** `pandas-ta` в актуальных версиях требует Python 3.12+.
-> На 3.11 индикаторы (Этап 2) будут реализованы собственным модулем на
-> pandas/numpy — внешняя TA-библиотека не обязательна.
+> Поэтому индикаторы (Этап 2) реализованы собственным модулем
+> `indicators/engine.py` на pandas/numpy (формулы Уайлдера) — внешняя
+> TA-библиотека не требуется.
 
 ## Запуск — Этап 1 (Data Layer)
 
@@ -48,6 +49,20 @@ python -m trading_bot.main stage1 --demo-funds     # + пополнить дем
 # агрегатора и выравнивания:
 python -m trading_bot.main stage1 --offline
 ```
+
+## Запуск — Этап 2 (Indicator Engine)
+
+Расчёт индикаторов по трём таймфреймам и снапшот последних значений
+(EMA 50/200, ADX, RSI/StochRSI, MACD, ATR, Bollinger).
+
+```bash
+python -m trading_bot.main stage2 --limit 300
+python -m trading_bot.main stage2 --offline          # без сети
+python -m trading_bot.main stage2 --offline --stoch-rsi   # Stoch RSI вместо RSI
+```
+
+Индикаторы каузальны (значение бара i зависит только от баров ≤ i);
+`swing_high/low` возвращают только подтверждённые экстремумы — без look-ahead.
 
 ### ⚠️ Ограничение сетевой политики окружения
 
