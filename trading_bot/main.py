@@ -717,6 +717,68 @@ def stage8_position(offline: bool = False, duration: float = 20.0,
     return 0
 
 
+def stage9_limits(offline: bool = False) -> int:
+    """Этап 9: Portfolio limits / kill switch — независимые автостопы (раздел 7 ТЗ)."""
+    from .risk.kill_switch import KillSwitch, KillSwitchConfig
+    from .risk.portfolio_limits import LimitConfig, PortfolioGuard
+
+    settings = load_settings()
+    setup_logging(settings.log_dir, settings.log_level)
+    cfg = LimitConfig.from_settings(settings)
+    guard = PortfolioGuard(cfg, starting_equity=10_000.0)
+    log.info("=== Этап 9: Portfolio limits / kill switch [%s] ===",
+             "OFFLINE" if offline else "LIVE-параметры")
+    log.info("Лимиты: сделка<=%.1f%% портфель<=%.1f%% поз<=%d день>=-%.0f%% "
+             "серия>=%d просадка>=%.0f%%",
+             cfg.risk_per_trade * 100, cfg.max_portfolio_risk * 100,
+             cfg.max_open_positions, cfg.daily_loss_limit * 100,
+             cfg.max_consecutive_losses, cfg.max_drawdown * 100)
+
+    fired = []
+
+    # 1) Лимит открытых позиций.
+    for _ in range(cfg.max_open_positions):
+        guard.register_open(50.0)
+    ok, reason = guard.can_open(50.0)
+    log.info("Вход сверх лимита позиций: allowed=%s (%s)", ok, reason)
+    fired.append(not ok)
+    for _ in range(cfg.max_open_positions):
+        guard.register_close(0.0, 50.0)
+
+    # 2) Серия убытков -> пауза.
+    guard2 = PortfolioGuard(LimitConfig(**{**cfg.__dict__, "daily_loss_limit": 1.0,
+                                           "max_drawdown": 1.0}), 10_000.0)
+    ev = []
+    for _ in range(cfg.max_consecutive_losses):
+        ev = guard2.register_close(pnl=-10.0, trade_risk_amount=0.0)
+    log.info("Серия убытков: halted=%s причины=%s", guard2.halted, guard2.halt_reasons)
+    fired.append(guard2.halted)
+
+    # 3) Просадка -> hard-стоп.
+    guard3 = PortfolioGuard(cfg, 10_000.0)
+    ev3 = guard3.on_equity(10_000.0 * (1 - cfg.max_drawdown - 0.01))
+    hard = any(e.hard for e in ev3)
+    log.info("Просадка: hard-стоп=%s (новый день не снимет)", hard)
+    fired.append(hard)
+
+    # 4) Kill switch: API-ошибки и разрыв фида.
+    ks = KillSwitch(KillSwitchConfig(max_api_errors=3, max_feed_gap_ms=1000))
+    for _ in range(3):
+        ks.record_api_error()
+    log.info("Kill switch по API-ошибкам: tripped=%s (%s)", ks.tripped, ks.reason)
+    fired.append(ks.tripped)
+    ks2 = KillSwitch(KillSwitchConfig(max_feed_gap_ms=1000))
+    ks2.record_feed(10_000)
+    ks2.check_feed_gap(11_500)
+    log.info("Kill switch по разрыву фида: tripped=%s (%s)", ks2.tripped, ks2.reason)
+    fired.append(ks2.tripped)
+
+    all_ok = all(fired)
+    log.info("=== Этап 9: все автостопы сработали как ожидалось: %s ===",
+             "✔" if all_ok else "НЕТ")
+    return 0 if all_ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trading Bot CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -786,6 +848,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Длительность live-сессии, сек")
     p8.add_argument("--reconcile-every", type=float, default=5.0,
                     help="Период REST-сверки, сек")
+
+    p9 = sub.add_parser("stage9", help="Portfolio limits / kill switch")
+    p9.add_argument("--offline", action="store_true",
+                    help="Демонстрация автостопов (сеть не требуется)")
     return parser
 
 
@@ -821,6 +887,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "stage8":
         return stage8_position(offline=args.offline, duration=args.duration,
                                reconcile_every=args.reconcile_every)
+    if args.command == "stage9":
+        return stage9_limits(offline=args.offline)
     return 2
 
 

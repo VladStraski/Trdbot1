@@ -18,7 +18,7 @@
 | 6 | **Risk Manager** (sizing, плечо от liq-safety, стоп/тейк, издержки в R:R) | ✅ реализован |
 | 7 | **Execution Engine** (demo-ордера, SL/TP reduce-only, dry-run) | ✅ реализован¹ |
 | 8 | **Position Manager** (WS-синхронизация + REST-сверка, backoff) | ✅ реализован¹ |
-| 9 | Portfolio limits / kill switch | ⏳ |
+| 9 | **Portfolio limits / kill switch** (circuit breakers, авто/ручной стоп) | ✅ реализован |
 | 10 | Notifications / мониторинг | ⏳ |
 
 ## Установка
@@ -158,6 +158,17 @@ python -m trading_bot.main stage7 --execute           # РЕАЛЬНЫЕ орд�
 ```bash
 python -m trading_bot.main stage8 --offline               # симуляция + сверка
 python -m trading_bot.main stage8 --duration 30 --reconcile-every 5
+```
+
+## Запуск — Этап 9 (Portfolio limits / kill switch)
+
+Независимый от стратегии слой автостопов (раздел 7 ТЗ): риск на сделку и по
+портфелю, лимит открытых позиций, дневной убыток (стоп до конца дня), серия
+убытков (пауза), просадка от пика (hard-стоп с ручным рестартом). Kill switch —
+ручной и авто (серия API-ошибок, разрыв фида цен, потеря соединения).
+
+```bash
+python -m trading_bot.main stage9 --offline
 ```
 
 > **Опциональные зависимости.** `config/settings.py` и CLI написаны так, что
