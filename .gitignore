@@ -1,0 +1,31 @@
+# Секреты — никогда не коммитить
+.env
+*.env
+!*.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Данные / БД / логи
+*.sqlite
+*.sqlite3
+*.db
+trading_bot/logs/*.log
+trading_bot/logs/*.jsonl
+data_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+.pytest_cache/
+.mypy_cache/

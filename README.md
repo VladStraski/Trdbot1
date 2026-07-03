@@ -1,1 +1,253 @@
-# Trdbot1
+# Trdbot1 — торговый бот для Bybit (linear perpetuals)
+
+Торговый бот на основе технического анализа с подтверждением через ордербук и
+рыночный контекст. Старт — paper trading на **Bybit Demo Trading**, переход на
+реальную торговлю только после успешного бэктеста и прогона на демо.
+
+Полное ТЗ и порядок этапов — в `TRADING_BOT_SPEC.md` (раздел 9).
+
+## Статус разработки
+
+| Этап | Модуль | Статус |
+|---|---|---|
+| 1 | **Data Layer** (Bybit-клиент, klines, multi-TF агрегатор, storage) | ✅ реализован |
+| 2 | **Indicator Engine** (ADX, EMA, RSI/StochRSI, MACD, ATR, BB, OBV, VWAP, свечи, свинги) | ✅ реализован |
+| 3 | **Order Book Module** (OBI, стены, спред, CVD; WS + офлайн-реплей) | ✅ реализован |
+| 4 | **Strategy Module** (confluence-скоринг, сигналы в лог; Market Context) | ✅ реализован |
+| 5 | **Backtester** (та же Strategy; издержки, look-ahead-защита, метрики) | ✅ реализован |
+| 6 | **Risk Manager** (sizing, плечо от liq-safety, стоп/тейк, издержки в R:R) | ✅ реализован |
+| 7 | **Execution Engine** (demo-ордера, SL/TP reduce-only, dry-run) | ✅ реализован¹ |
+| 8 | **Position Manager** (WS-синхронизация + REST-сверка, backoff) | ✅ реализован¹ |
+| 9 | **Portfolio limits / kill switch** (circuit breakers, авто/ручной стоп) | ✅ реализован |
+| 10 | **Notifications / мониторинг** (веерная рассылка, Telegram, heartbeat) | ✅ реализован |
+
+## Установка
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp trading_bot/config/.env.example trading_bot/config/.env
+# заполнить .env: BYBIT_ENV=demo и ключи BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET
+```
+
+> **Python 3.11 vs 3.12.** `pandas-ta` в актуальных версиях требует Python 3.12+.
+> Поэтому индикаторы (Этап 2) реализованы собственным модулем
+> `indicators/engine.py` на pandas/numpy (формулы Уайлдера) — внешняя
+> TA-библиотека не требуется.
+
+## Запуск — Этап 1 (Data Layer)
+
+Health-check: подключение к Bybit, загрузка klines по 3 таймфреймам,
+наполнение multi-TF агрегатора и проверка выравнивания **без look-ahead**.
+
+```bash
+# Живой прогон (нужен доступ к api.bybit.com / api-demo.bybit.com):
+python -m trading_bot.main stage1 --limit 300
+python -m trading_bot.main stage1 --demo-funds     # + пополнить демо-баланс
+
+# Офлайн-прогон на синтетических данных (без сети) — проверяет всю логику
+# агрегатора и выравнивания:
+python -m trading_bot.main stage1 --offline
+```
+
+## Запуск — Этап 2 (Indicator Engine)
+
+Расчёт индикаторов по трём таймфреймам и снапшот последних значений
+(EMA 50/200, ADX, RSI/StochRSI, MACD, ATR, Bollinger).
+
+```bash
+python -m trading_bot.main stage2 --limit 300
+python -m trading_bot.main stage2 --offline          # без сети
+python -m trading_bot.main stage2 --offline --stoch-rsi   # Stoch RSI вместо RSI
+```
+
+Индикаторы каузальны (значение бара i зависит только от баров ≤ i);
+`swing_high/low` возвращают только подтверждённые экстремумы — без look-ahead.
+
+## Запуск — Этап 3 (Order Book Module)
+
+Реал-тайм микро-триггеры (раздел 5 ТЗ): **OBI** (Order Book Imbalance), **стены**
+(крупные заявки), **спред** по стакану `orderbook.{depth}.{symbol}` и **CVD**
+(Cumulative Volume Delta) по потоку сделок `publicTrade.{symbol}`.
+
+```bash
+# Живой прогон: публичный WS stream.bybit.com (общий для mainnet и demo):
+python -m trading_bot.main stage3 --duration 20 --depth 50
+
+# Офлайн: проигрывание детерминированного синтетического потока (без сети),
+# через те же обработчики, что и live-контур:
+python -m trading_bot.main stage3 --offline
+```
+
+Транспорт (`data/ws_public.py`, pybit) отделён от обработчиков
+(`data/orderbook.py`, `data/trades_stream.py` — чистый stdlib), поэтому вся
+логика проверяется офлайн проигрыванием потока (`data/stream_replay.py`), без
+сети и без pandas/pybit.
+
+## Запуск — Этап 4 (Strategy Module)
+
+Confluence-скоринг (раздел 6 ТЗ): обязательный трендовый фильтр 4h (EMA50/200,
+ADX>20) + очки по слоям 1h/15m, микро-контексту (OBI, CVD) и funding. Порог входа
+по сумме очков (дефолт 6). Сигналы **только в лог** — реальные ордера с Этапа 7.
+
+```bash
+# Демонстрация скоринга на синтетических сценариях (без сети/pandas/pybit):
+python -m trading_bot.main stage4 --offline
+# Живая единичная оценка на последних закрытых барах:
+python -m trading_bot.main stage4 --limit 400
+```
+
+Скоринг отделён от pandas: `strategy/` работает на `FeatureSnapshot` (скаляры) и
+одинаков в live и бэктесте; извлечение признаков из свечей (pandas) — тонкий
+адаптер `base_strategy.extract_features`. Market Context (`market_context/`:
+funding, open interest, long/short ratio) — REST-обёртки с инъектируемым клиентом.
+
+## Запуск — Этап 5 (Backtester)
+
+Прогон **той же** `BaseStrategy` по истории с обязательным учётом издержек
+(комиссии maker/taker + funding, раздел 7 ТЗ) и защитой от look-ahead: вход по
+close сигнального бара, проверка SL/TP — только со следующего бара.
+
+```bash
+python -m trading_bot.main stage5 --offline     # синтетика (без сети/pandas)
+python -m trading_bot.main stage5 --limit 800   # по живым klines
+```
+
+Движок работает на плоских `Bar`+`FeatureSnapshot` (stdlib); стоп/размер вынесены
+в инъектируемые функции (`default_sl_tp`/`default_sizing`) — на Этапе 6 их
+заменяет Risk Manager без переписывания движка.
+
+## Запуск — Этап 6 (Risk Manager)
+
+Единое риск-решение по сделке (раздел 7 ТЗ): fixed-fractional sizing, стоп по
+ATR/swing, плечо от безопасности ликвидации (дистанция до ликвидации ≥ 3×
+дистанции стопа, потолок 5x), тейк с поправкой на издержки (R:R после комиссий и
+funding ≥ min_rr). Те же адаптеры (`as_sl_tp_fn`/`as_sizing_fn`) подключаются в
+бэктест Этапа 5 — логика риска одна для live и истории.
+
+```bash
+python -m trading_bot.main stage6 --offline   # риск-решения + бэктест через RM
+python -m trading_bot.main stage6 --limit 800 # решение по живому equity/сигналу
+```
+
+## Запуск — Этап 7 (Execution Engine)
+
+Превращает одобренное риск-решение в ордер через единый demo/prod клиент. Перед
+входом выставляются ISOLATED-маржа и плечо; SL и TP уходят на биржу **вместе с
+входом** как reduce-only (раздел 7 ТЗ) — не хранятся в памяти. Есть kill-switch
+(reduce-only закрытие) и dry-run.
+
+```bash
+python -m trading_bot.main stage7 --offline          # сухой прогон (без сети)
+python -m trading_bot.main stage7                     # live, но DRY-RUN (по умолч.)
+python -m trading_bot.main stage7 --execute           # РЕАЛЬНЫЕ ордера (только demo)
+```
+
+> ¹ **Live-долг.** Формирование ордеров покрыто офлайн-тестами с фейковым HTTP;
+> реальная отправка на Bybit Demo (`--execute`) требует доступа к
+> `api-demo.bybit.com`, закрытого текущей egress-политикой — проверяется в
+> сессии с открытым allowlist. Без `--execute` даже live-режим не шлёт ордера.
+
+## Запуск — Этап 8 (Position Manager)
+
+Синхронизация внутреннего состояния с биржей (раздел 9–10 ТЗ): приватный WS
+(`position`) для реального времени + периодическая REST-сверка как независимый
+бэкстоп; расхождение = алерт, источник истины — биржа. Reconnect с
+экспоненциальным backoff (`reconnect.py`).
+
+```bash
+python -m trading_bot.main stage8 --offline               # симуляция + сверка
+python -m trading_bot.main stage8 --duration 30 --reconcile-every 5
+```
+
+## Запуск — Этап 9 (Portfolio limits / kill switch)
+
+Независимый от стратегии слой автостопов (раздел 7 ТЗ): риск на сделку и по
+портфелю, лимит открытых позиций, дневной убыток (стоп до конца дня), серия
+убытков (пауза), просадка от пика (hard-стоп с ручным рестартом). Kill switch —
+ручной и авто (серия API-ошибок, разрыв фида цен, потеря соединения).
+
+```bash
+python -m trading_bot.main stage9 --offline
+```
+
+## Запуск — Этап 10 (Notifications / мониторинг)
+
+Веерная рассылка событий (сигналы, ордера, circuit breakers, ошибки) по каналам:
+лог — всегда, Telegram — опционально (при заданных токене/chat_id). Heartbeat
+отслеживает свежесть контуров (основа авто-детекции зависания вместе с kill
+switch).
+
+```bash
+python -m trading_bot.main stage10 --offline
+```
+
+Каналы инъектируются (Telegram-транспорт — тоже), поэтому форматирование и логика
+тестируются офлайн без сети.
+
+> **Опциональные зависимости.** `config/settings.py` и CLI написаны так, что
+> офлайн-контур этапов 3–10 (`stageN --offline`) работает без установленных
+> `pandas`/`pybit`/`python-dotenv` — тяжёлые пакеты импортируются лениво там, где
+> реально нужны. Так проверяется вся логика в окружении без доступа к PyPI.
+
+### ⚠️ Ограничение сетевой политики окружения
+
+В managed-окружении Claude Code исходящий трафик к Bybit фильтруется egress-
+прокси. Наблюдалось: REST-хосты `api.bybit.com` / `api-demo.bybit.com` и
+demo-WS `stream-demo.bybit.com` — **403 на CONNECT**; публичный WS
+`stream.bybit.com` — доступен. Поэтому:
+- **живой** прогон Этапов 1–2 (нужен REST) выполняется там, где домен Bybit
+  разрешён политикой; в managed-окружении — `--offline`;
+- **Этап 3** в live-режиме использует только `stream.bybit.com` (публичные
+  данные общие для mainnet/demo), а для проверки логики есть `--offline`.
+
+> При закрытом доступе к PyPI зависимости (`pandas`, `pybit`, `pytest`) не
+> устанавливаются — тогда доступен только stdlib-контур Этапа 3 и его тесты.
+
+## Тесты
+
+```bash
+python -m pytest tests/ -q
+```
+
+Офлайн-тесты покрывают нормализацию klines, защиту от look-ahead в
+multi-TF агрегаторе, индикаторы, а также Order Book Module (снапшот/дельта
+стакана, OBI, стены, спред, CVD) — не требуют сети и ключей.
+
+Тесты Этапа 3 (`tests/test_orderbook.py`, `tests/test_trades_stream.py`)
+опираются только на stdlib и проходят даже без установленных `pandas`/`pybit`.
+
+## Структура
+
+```
+trading_bot/
+├── config/          settings.py (dotenv опционален), .env.example (demo/prod)
+├── data/            klines, multi_tf_aggregator, orderbook, trades_stream,
+│                    ws_public, stream_replay
+├── indicators/      engine.py (EMA/RSI/MACD/ATR/ADX/BB/OBV/VWAP/свечи/свинги)
+├── market_context/  funding, open_interest, long_short_ratio
+├── strategy/        model, context_filter, signal_layer, trigger_layer,
+│                    confluence_scorer, base_strategy
+├── risk/            position_sizing, leverage_manager, stop_take_manager,
+│                    costs, risk_manager, portfolio_limits, kill_switch
+├── backtest/        engine.py, history.py
+├── execution/       bybit_client, execution_engine, position_manager, private_ws
+├── notifications/   telegram.py, monitor.py
+├── storage/         models.py (SQLite: сделки, сигналы, equity)
+├── reconnect.py     backoff-политика WS
+├── logger.py        структурированные логи (консоль + .jsonl)
+└── main.py          CLI: stage1..stage10
+tests/               офлайн-тесты (stdlib-контур работает без pandas/pybit)
+```
+
+**Архитектурный принцип.** Логика отделена от транспорта и тяжёлых зависимостей:
+стратегия, риск, ордербук, CVD, бэктест, лимиты, уведомления работают на чистом
+stdlib и проверяются офлайн; pandas (индикаторы/адаптеры) и pybit (REST/WS)
+импортируются лениво только там, где реально нужны. Одна и та же логика стратегии
+и риска используется и в live, и в бэктесте.
+
+## Безопасность
+
+- API-ключи только в `.env` (в `.gitignore`), demo и prod — раздельно.
+- Окружение выбирается **явно** через `BYBIT_ENV`, без автоопределения.
+- Логируется каждое решение стратегии, не только сделки.
