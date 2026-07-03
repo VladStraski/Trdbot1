@@ -1,0 +1,12 @@
+# Core
+pybit>=5.7            # официальный SDK Bybit (REST + WS v5, поддержка demo=True)
+pandas>=2.0
+python-dotenv>=1.0
+
+# Indicators (Этап 2) — pandas-ta требует Python 3.12+.
+# На Python 3.11 используется собственная реализация индикаторов (indicators/engine.py),
+# внешняя TA-библиотека не требуется. Раскомментировать при переходе на 3.12+:
+# pandas-ta>=0.3.14b0
+
+# Tests
+pytest>=7.0
