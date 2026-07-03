@@ -13,7 +13,7 @@
 | 1 | **Data Layer** (Bybit-клиент, klines, multi-TF агрегатор, storage) | ✅ реализован |
 | 2 | **Indicator Engine** (ADX, EMA, RSI/StochRSI, MACD, ATR, BB, OBV, VWAP, свечи, свинги) | ✅ реализован |
 | 3 | **Order Book Module** (OBI, стены, спред, CVD; WS + офлайн-реплей) | ✅ реализован |
-| 4 | Strategy Module (confluence) | ⏳ |
+| 4 | **Strategy Module** (confluence-скоринг, сигналы в лог; Market Context) | ✅ реализован |
 | 5 | Backtester | ⏳ |
 | 6 | Risk Manager | ⏳ |
 | 7 | Execution Engine | ⏳ |
@@ -83,6 +83,28 @@ python -m trading_bot.main stage3 --offline
 (`data/orderbook.py`, `data/trades_stream.py` — чистый stdlib), поэтому вся
 логика проверяется офлайн проигрыванием потока (`data/stream_replay.py`), без
 сети и без pandas/pybit.
+
+## Запуск — Этап 4 (Strategy Module)
+
+Confluence-скоринг (раздел 6 ТЗ): обязательный трендовый фильтр 4h (EMA50/200,
+ADX>20) + очки по слоям 1h/15m, микро-контексту (OBI, CVD) и funding. Порог входа
+по сумме очков (дефолт 6). Сигналы **только в лог** — реальные ордера с Этапа 7.
+
+```bash
+# Демонстрация скоринга на синтетических сценариях (без сети/pandas/pybit):
+python -m trading_bot.main stage4 --offline
+# Живая единичная оценка на последних закрытых барах:
+python -m trading_bot.main stage4 --limit 400
+```
+
+Скоринг отделён от pandas: `strategy/` работает на `FeatureSnapshot` (скаляры) и
+одинаков в live и бэктесте; извлечение признаков из свечей (pandas) — тонкий
+адаптер `base_strategy.extract_features`. Market Context (`market_context/`:
+funding, open interest, long/short ratio) — REST-обёртки с инъектируемым клиентом.
+
+> **Опциональные зависимости.** `config/settings.py` и CLI написаны так, что
+> `stage3`/`stage4 --offline` работают без установленных `pandas`/`pybit`/
+> `python-dotenv` — тяжёлые пакеты импортируются лениво там, где реально нужны.
 
 ### ⚠️ Ограничение сетевой политики окружения
 

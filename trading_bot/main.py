@@ -21,15 +21,12 @@ from __future__ import annotations
 import argparse
 import time
 
-import pandas as pd
-
+# Только stdlib-безопасные импорты на уровне модуля (settings без dotenv-требования,
+# logger — stdlib). Тяжёлые зависимости (pandas/pybit) импортируются лениво внутри
+# функций тех этапов, где реально нужны, — чтобы офлайн-контур этапов 3–4 работал
+# и в окружении без pandas/pybit.
 from .config.settings import TF_MS, Settings, load_settings
-from .data.klines import fetch_klines
-from .data.multi_tf_aggregator import MultiTFAggregator
-from .execution.bybit_client import BybitClient
-from .indicators.engine import IndicatorConfig, IndicatorEngine
 from .logger import get_logger, setup_logging
-from .storage.models import Storage
 
 log = get_logger("main")
 
@@ -38,9 +35,11 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _synthetic_klines(tf: str, n: int, end_ms: int) -> pd.DataFrame:
+def _synthetic_klines(tf: str, n: int, end_ms: int):
     """Синтетические закрытые свечи для офлайн-прогона (детерминированный
     ряд без внешних данных; случайность не используется намеренно)."""
+    import pandas as pd
+
     step = TF_MS[tf]
     last_open = (end_ms // step) * step - step  # последняя полностью закрытая
     rows = []
@@ -63,6 +62,11 @@ def _populate_aggregator(settings: Settings, klines_limit: int, offline: bool,
     Возвращает готовый агрегатор либо None при неустранимой ошибке.
     Общий код для stage1/stage2.
     """
+    from .data.klines import fetch_klines
+    from .data.multi_tf_aggregator import MultiTFAggregator
+    from .execution.bybit_client import BybitClient
+    from .storage.models import Storage
+
     tfs = [settings.tf_context, settings.tf_signal, settings.tf_trigger]
     agg = MultiTFAggregator(timeframes=tfs)
     now = _now_ms()
@@ -154,6 +158,10 @@ def stage2_indicators(klines_limit: int = 300, offline: bool = False,
                       use_stoch_rsi: bool = False) -> int:
     """Этап 2: расчёт индикаторов на исторических данных сигнального TF (1h)
     и снапшот последних значений (замена «проверки на графике» в CLI)."""
+    import pandas as pd
+
+    from .indicators.engine import IndicatorConfig, IndicatorEngine
+
     settings = load_settings()
     setup_logging(settings.log_dir, settings.log_level)
     mode = "OFFLINE (синтетика)" if offline else "LIVE (Bybit REST)"
@@ -299,6 +307,114 @@ def stage3_orderbook(offline: bool = False, duration: float = 15.0,
     return 0 if order_book.ready else 1
 
 
+def stage4_strategy(offline: bool = False, klines_limit: int = 400,
+                    use_stoch_rsi: bool = False) -> int:
+    """Этап 4: Strategy Module — confluence-скоринг, сигналы ТОЛЬКО в лог.
+
+    offline=True — прогон готовых синтетических наборов признаков через скоринг
+    (демонстрирует все ветки: вход в лонг/шорт, отсев по фильтру, недобор порога).
+    Работает на чистом stdlib — без сети, pandas и pybit.
+
+    offline=False — сборка признаков из живых данных (агрегатор REST + индикаторы +
+    микро-контекст WS + funding) и одна оценка на последнем закрытом триггер-баре.
+    """
+    from .strategy.base_strategy import BaseStrategy
+    from .strategy.model import FeatureSnapshot, ScoreConfig
+
+    settings = load_settings()
+    setup_logging(settings.log_dir, settings.log_level)
+    cfg = ScoreConfig(entry_threshold=settings.entry_score_threshold,
+                      use_stoch_rsi=use_stoch_rsi)
+    strategy = BaseStrategy(cfg)
+    mode = "OFFLINE (синтетика)" if offline else "LIVE (данные Bybit)"
+    log.info("=== Этап 4: Strategy Module [%s] порог=%d ===",
+             mode, cfg.entry_threshold)
+
+    if offline:
+        scenarios = _synthetic_feature_scenarios(FeatureSnapshot)
+        entered = 0
+        for name, feat in scenarios:
+            log.info("--- сценарий: %s ---", name)
+            sig = strategy.evaluate(feat)
+            if sig.entered:
+                entered += 1
+                log.info("  ВХОД %s: score=%d, вклад=%s",
+                         sig.direction.upper(), sig.score,
+                         [(p.label, p.points) for p in sig.breakdown])
+        log.info("=== Этап 4 (offline): %d/%d сценариев дали вход ✔ ===",
+                 entered, len(scenarios))
+        # Санити: должен быть хотя бы один вход и хотя бы один отказ.
+        return 0 if 0 < entered < len(scenarios) else 1
+
+    # --- LIVE: единичная оценка на последних закрытых барах ---
+    from .indicators.engine import IndicatorConfig, IndicatorEngine
+
+    agg = _populate_aggregator(settings, klines_limit, offline=False)
+    if agg is None:
+        return 1
+    engine = IndicatorEngine(IndicatorConfig(use_stoch_rsi=use_stoch_rsi))
+
+    obi = cvd_delta = funding_rate = None
+    # Микро-контекст и funding — best-effort (могут быть недоступны по сети).
+    try:
+        from .market_context.funding import FundingContext
+        from .execution.bybit_client import BybitClient
+        funding_rate = FundingContext(BybitClient(settings)).current_rate()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("funding недоступен: %s", exc)
+
+    last_trigger = agg.latest(settings.tf_trigger, 1)
+    if last_trigger.empty:
+        log.error("Нет триггер-баров для оценки")
+        return 1
+    ref_time = int(last_trigger.iloc[0]["close_time"])
+    feat = strategy.extract_features(
+        agg, engine, ref_time,
+        settings.tf_context, settings.tf_signal, settings.tf_trigger,
+        obi=obi, cvd_delta=cvd_delta, funding_rate=funding_rate,
+    )
+    if feat is None:
+        log.error("Недостаточно истории для извлечения признаков")
+        return 1
+    strategy.evaluate(feat)
+    log.info("=== Этап 4 (live) завершён ✔ ===")
+    return 0
+
+
+def _synthetic_feature_scenarios(FeatureSnapshot):
+    """Детерминированные наборы признаков для офлайн-демонстрации скоринга."""
+    strong_long = FeatureSnapshot(
+        price=30000.0, ts=1, ema_fast=31000.0, ema_slow=30000.0, adx=30.0,
+        osc=35.0, osc_prev=28.0, macd_hist=0.5, macd_hist_prev=0.2,
+        bull_pattern=True, at_swing_low=True, volume=150.0, volume_avg=100.0,
+        obi=0.3, cvd_delta=1.2, funding_rate=0.0001,
+    )
+    strong_short = FeatureSnapshot(
+        price=30000.0, ts=2, ema_fast=29000.0, ema_slow=30000.0, adx=28.0,
+        osc=65.0, osc_prev=72.0, macd_hist=-0.5, macd_hist_prev=-0.2,
+        bear_pattern=True, at_swing_high=True, volume=150.0, volume_avg=100.0,
+        obi=-0.3, cvd_delta=-1.2, funding_rate=-0.0001,
+    )
+    no_trend = FeatureSnapshot(
+        price=30000.0, ts=3, ema_fast=30010.0, ema_slow=30000.0, adx=15.0,
+        osc=35.0, osc_prev=28.0, macd_hist=0.5, macd_hist_prev=0.2,
+        bull_pattern=True, at_swing_low=True, volume=150.0, volume_avg=100.0,
+        obi=0.3, cvd_delta=1.2, funding_rate=0.0001,
+    )
+    weak_long = FeatureSnapshot(  # тренд есть, но подтверждений мало -> недобор
+        price=30000.0, ts=4, ema_fast=31000.0, ema_slow=30000.0, adx=30.0,
+        osc=50.0, osc_prev=49.0, macd_hist=0.1, macd_hist_prev=0.2,
+        bull_pattern=False, at_swing_low=False, volume=90.0, volume_avg=100.0,
+        obi=None, cvd_delta=None, funding_rate=0.0001,
+    )
+    return [
+        ("strong_long", strong_long),
+        ("strong_short", strong_short),
+        ("no_trend_flat", no_trend),
+        ("weak_long_below_threshold", weak_long),
+    ]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trading Bot CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -330,6 +446,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Сколько уровней брать для расчёта OBI")
     p3.add_argument("--cvd-window", type=int, default=60_000,
                     help="Окно расчёта дельты CVD, мс")
+
+    p4 = sub.add_parser("stage4", help="Strategy Module (confluence-скоринг)")
+    p4.add_argument("--offline", action="store_true",
+                    help="Прогон синтетических сценариев без сети")
+    p4.add_argument("--limit", type=int, default=400,
+                    help="Сколько свечей грузить на каждый TF (live)")
+    p4.add_argument("--stoch-rsi", action="store_true",
+                    help="Использовать Stoch RSI вместо RSI")
     return parser
 
 
@@ -349,6 +473,10 @@ def main(argv: list[str] | None = None) -> int:
                                 depth=args.depth,
                                 obi_depth=args.obi_depth,
                                 cvd_window_ms=args.cvd_window)
+    if args.command == "stage4":
+        return stage4_strategy(offline=args.offline,
+                               klines_limit=args.limit,
+                               use_stoch_rsi=args.stoch_rsi)
     return 2
 
 

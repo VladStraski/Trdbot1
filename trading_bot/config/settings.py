@@ -12,16 +12,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
-
 # Корень пакета: .../trading_bot
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 # Корень репозитория: .../Trdbot1
 PROJECT_ROOT = PACKAGE_ROOT.parent
 
-# .env ищем в config/.env (рядом с этим файлом). Не перетираем уже выставленное
-# окружение (override=False), чтобы можно было задать переменные извне.
-load_dotenv(PACKAGE_ROOT / "config" / ".env", override=False)
+
+def _load_dotenv() -> None:
+    """Подхватить config/.env, если установлен python-dotenv.
+
+    python-dotenv — опциональная зависимость: переменные окружения можно задать
+    и извне. Если пакет не установлен, просто пропускаем загрузку файла (важно
+    для окружений без доступа к PyPI — работает stdlib-контур без .env-файла).
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    # Не перетираем уже выставленное окружение (override=False).
+    load_dotenv(PACKAGE_ROOT / "config" / ".env", override=False)
+
+
+_load_dotenv()
 
 
 # --- Маппинг человекочитаемых TF в интервалы Bybit v5 kline ---

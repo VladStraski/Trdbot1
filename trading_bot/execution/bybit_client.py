@@ -11,9 +11,10 @@ read-методы (баланс, klines) и пополнение демо-бал
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from pybit.unified_trading import HTTP
+if TYPE_CHECKING:  # только для аннотаций; pybit не требуется для импорта модуля
+    from pybit.unified_trading import HTTP
 
 from ..config.settings import Settings
 from ..logger import get_logger
@@ -28,12 +29,13 @@ class BybitClientError(RuntimeError):
 class BybitClient:
     """Тонкая обёртка над pybit HTTP с единым demo/prod поведением."""
 
-    def __init__(self, settings: Settings, http: Optional[HTTP] = None) -> None:
+    def __init__(self, settings: Settings, http: "Optional[HTTP]" = None) -> None:
         self.settings = settings
         # http можно подменить в тестах (fake), иначе создаём реальную сессию.
         if http is not None:
             self._http = http
         else:
+            from pybit.unified_trading import HTTP  # ленивый импорт зависимости
             self._http = HTTP(
                 testnet=False,
                 demo=settings.is_demo,      # demo=True -> api-demo.bybit.com
@@ -123,6 +125,40 @@ class BybitClient:
         ))
         items = result.get("list", [])
         return items[0] if items else {}
+
+    def get_tickers(self, symbol: Optional[str] = None,
+                    category: Optional[str] = None) -> dict[str, Any]:
+        """Тикер инструмента: lastPrice, fundingRate, nextFundingTime, openInterest."""
+        result = self._unwrap(self._http.get_tickers(
+            category=category or self.settings.category,
+            symbol=symbol or self.settings.symbol,
+        ))
+        items = result.get("list", [])
+        return items[0] if items else {}
+
+    def get_open_interest(self, interval: str = "5min", limit: int = 50,
+                          symbol: Optional[str] = None,
+                          category: Optional[str] = None) -> list[dict[str, Any]]:
+        """История open interest (список точек, новые сверху)."""
+        result = self._unwrap(self._http.get_open_interest(
+            category=category or self.settings.category,
+            symbol=symbol or self.settings.symbol,
+            intervalTime=interval,
+            limit=limit,
+        ))
+        return result.get("list", [])
+
+    def get_long_short_ratio(self, period: str = "5min", limit: int = 50,
+                             symbol: Optional[str] = None,
+                             category: Optional[str] = None) -> list[dict[str, Any]]:
+        """История long/short ratio (список точек, новые сверху)."""
+        result = self._unwrap(self._http.get_long_short_ratio(
+            category=category or self.settings.category,
+            symbol=symbol or self.settings.symbol,
+            period=period,
+            limit=limit,
+        ))
+        return result.get("list", [])
 
     def ping(self) -> bool:
         """Быстрая проверка доступности API (server time)."""
