@@ -648,6 +648,75 @@ def stage7_execution(offline: bool = False, execute: bool = False,
     return 0 if result.ok else 1
 
 
+def stage8_position(offline: bool = False, duration: float = 20.0,
+                    reconcile_every: float = 5.0) -> int:
+    """Этап 8: Position Manager — синхронизация состояния с биржей.
+
+    offline=True — проигрывание событий позиций + сверка с REST-снапшотами
+    (совпадающим и расходящимся) без сети.
+    offline=False — приватный WS + периодическая REST-сверка (расхождение = алерт).
+    """
+    from .execution.position_manager import PositionManager
+    from .reconnect import ReconnectPolicy
+
+    settings = load_settings()
+    setup_logging(settings.log_dir, settings.log_level)
+    pm = PositionManager()
+    mode = "OFFLINE (симуляция)" if offline else "LIVE (приватный WS + REST)"
+    log.info("=== Этап 8: Position Manager [%s] ===", mode)
+
+    if offline:
+        sym = settings.symbol
+        pm.apply_events([{"symbol": sym, "side": "Buy", "size": "0.5",
+                          "entryPrice": "30000", "liqPrice": "27000",
+                          "leverage": "5", "updatedTime": "1"}])
+        st = pm.get(sym)
+        log.info("После WS-события: %s size=%.4f entry=%.2f", st.side, st.size,
+                 st.entry_price)
+        # Сверка с расходящимся снапшотом.
+        diffs = pm.reconcile([{"symbol": sym, "side": "Buy", "size": "0.7",
+                               "entryPrice": "30000"}])
+        log.info("Сверка #1: расхождений=%d (ожидаемо >0)", len(diffs))
+        # Повторная сверка — теперь совпадает.
+        diffs2 = pm.reconcile([{"symbol": sym, "side": "Buy", "size": "0.7",
+                                "entryPrice": "30000"}])
+        log.info("Сверка #2: расхождений=%d (ожидаемо 0)", len(diffs2))
+        policy = ReconnectPolicy()
+        log.info("Backoff переподключения (сек): %s", policy.delays(6))
+        ok = len(diffs) > 0 and len(diffs2) == 0
+        log.info("=== Этап 8 (offline): синхронизация %s ===",
+                 "OK ✔" if ok else "ОШИБКА")
+        return 0 if ok else 1
+
+    # --- LIVE ---
+    from .execution.bybit_client import BybitClient
+    from .execution.private_ws import PrivateWSFeed
+
+    client = BybitClient(settings)
+    feed = PrivateWSFeed(settings, position_manager=pm)
+    try:
+        feed.start()
+    except ImportError:
+        log.error("pybit не установлен — live-режим недоступен")
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        log.error("Приватный WS недоступен: %s", exc)
+        return 1
+    try:
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            time.sleep(reconcile_every)
+            try:
+                diffs = pm.reconcile(client.get_positions())
+                log.info("REST-сверка: расхождений=%d", len(diffs))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Сверка не удалась: %s", exc)
+    finally:
+        feed.stop()
+    log.info("=== Этап 8 (live) завершён ✔ ===")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trading Bot CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -709,6 +778,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Отправлять РЕАЛЬНЫЕ ордера (только demo). Без флага — dry-run")
     p7.add_argument("--limit", type=int, default=400,
                     help="Сколько свечей грузить (live)")
+
+    p8 = sub.add_parser("stage8", help="Position Manager (синхронизация с биржей)")
+    p8.add_argument("--offline", action="store_true",
+                    help="Симуляция событий и сверки без сети")
+    p8.add_argument("--duration", type=float, default=20.0,
+                    help="Длительность live-сессии, сек")
+    p8.add_argument("--reconcile-every", type=float, default=5.0,
+                    help="Период REST-сверки, сек")
     return parser
 
 
@@ -741,6 +818,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "stage7":
         return stage7_execution(offline=args.offline, execute=args.execute,
                                 klines_limit=args.limit)
+    if args.command == "stage8":
+        return stage8_position(offline=args.offline, duration=args.duration,
+                               reconcile_every=args.reconcile_every)
     return 2
 
 

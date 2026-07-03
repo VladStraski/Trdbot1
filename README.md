@@ -17,7 +17,7 @@
 | 5 | **Backtester** (та же Strategy; издержки, look-ahead-защита, метрики) | ✅ реализован |
 | 6 | **Risk Manager** (sizing, плечо от liq-safety, стоп/тейк, издержки в R:R) | ✅ реализован |
 | 7 | **Execution Engine** (demo-ордера, SL/TP reduce-only, dry-run) | ✅ реализован¹ |
-| 8 | Position Manager + синхронизация | ⏳ |
+| 8 | **Position Manager** (WS-синхронизация + REST-сверка, backoff) | ✅ реализован¹ |
 | 9 | Portfolio limits / kill switch | ⏳ |
 | 10 | Notifications / мониторинг | ⏳ |
 
@@ -147,6 +147,18 @@ python -m trading_bot.main stage7 --execute           # РЕАЛЬНЫЕ орд�
 > реальная отправка на Bybit Demo (`--execute`) требует доступа к
 > `api-demo.bybit.com`, закрытого текущей egress-политикой — проверяется в
 > сессии с открытым allowlist. Без `--execute` даже live-режим не шлёт ордера.
+
+## Запуск — Этап 8 (Position Manager)
+
+Синхронизация внутреннего состояния с биржей (раздел 9–10 ТЗ): приватный WS
+(`position`) для реального времени + периодическая REST-сверка как независимый
+бэкстоп; расхождение = алерт, источник истины — биржа. Reconnect с
+экспоненциальным backoff (`reconnect.py`).
+
+```bash
+python -m trading_bot.main stage8 --offline               # симуляция + сверка
+python -m trading_bot.main stage8 --duration 30 --reconcile-every 5
+```
 
 > **Опциональные зависимости.** `config/settings.py` и CLI написаны так, что
 > `stage3`/`stage4 --offline` работают без установленных `pandas`/`pybit`/
