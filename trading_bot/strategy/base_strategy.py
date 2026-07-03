@@ -84,11 +84,15 @@ class BaseStrategy:
 
         # Подтверждённый swing у триггер-бара (без look-ahead: последний бар,
         # который уже мог быть подтверждён `right` барами справа).
-        from ..indicators.engine import swing_high, swing_low
+        from ..indicators.engine import (last_confirmed_swing, swing_high,
+                                          swing_low)
         sw_low = swing_low(trg)
         sw_high = swing_high(trg)
         at_swing_low = bool(sw_low.iloc[-3:].any()) if len(sw_low) >= 3 else False
         at_swing_high = bool(sw_high.iloc[-3:].any()) if len(sw_high) >= 3 else False
+        last_idx = len(trg) - 1
+        swing_low_price = last_confirmed_swing(trg, last_idx, "low")
+        swing_high_price = last_confirmed_swing(trg, last_idx, "high")
 
         vol_avg = float(trg["volume"].tail(volume_window).mean())
 
@@ -112,6 +116,9 @@ class BaseStrategy:
             at_swing_high=at_swing_high,
             volume=_f(trg_last, "volume"),
             volume_avg=vol_avg,
+            atr=_f(trg_last, "atr"),
+            swing_low_price=swing_low_price,
+            swing_high_price=swing_high_price,
             obi=obi,
             cvd_delta=cvd_delta,
             funding_rate=funding_rate,

@@ -415,6 +415,86 @@ def _synthetic_feature_scenarios(FeatureSnapshot):
     ]
 
 
+def stage5_backtest(offline: bool = False, klines_limit: int = 800,
+                    use_stoch_rsi: bool = False) -> int:
+    """Этап 5: Backtester — прогон стратегии по истории с учётом издержек.
+
+    offline=True — синтетическая серия баров/признаков (без сети/pandas): проверяет
+    учёт SL/TP, издержек, метрик и защиту от look-ahead.
+    offline=False — серия из живых klines через выровненный агрегатор.
+    """
+    from .backtest.engine import Backtester, BacktestConfig
+    from .strategy.base_strategy import BaseStrategy
+    from .strategy.model import ScoreConfig
+
+    settings = load_settings()
+    setup_logging(settings.log_dir, settings.log_level)
+    cfg = ScoreConfig(entry_threshold=settings.entry_score_threshold,
+                      use_stoch_rsi=use_stoch_rsi)
+    strategy = BaseStrategy(cfg)
+    bt_cfg = BacktestConfig(risk_pct=settings.risk_pct_per_trade,
+                            atr_stop_mult=settings.atr_stop_mult,
+                            min_rr=settings.min_rr)
+    bt = Backtester(strategy, bt_cfg)
+    mode = "OFFLINE (синтетика)" if offline else "LIVE (klines Bybit)"
+    log.info("=== Этап 5: Backtester [%s] ===", mode)
+
+    if offline:
+        from .backtest.engine import Bar
+        from .strategy.model import FeatureSnapshot
+        series = _synthetic_backtest_series(FeatureSnapshot, Bar)
+    else:
+        from .backtest.history import series_from_aggregator
+        from .indicators.engine import IndicatorConfig, IndicatorEngine
+        agg = _populate_aggregator(settings, klines_limit, offline=False)
+        if agg is None:
+            return 1
+        engine = IndicatorEngine(IndicatorConfig(use_stoch_rsi=use_stoch_rsi))
+        series = series_from_aggregator(
+            agg, engine, strategy,
+            settings.tf_context, settings.tf_signal, settings.tf_trigger)
+
+    if not series:
+        log.error("Пустая серия для бэктеста")
+        return 1
+
+    result = bt.run(series)
+    s = result.summary()
+    log.info("Итог: сделок=%d винрейт=%.0f%% PnL=%.2f (%.2f%%) PF=%s DD=%.1f%% "
+             "комиссии=%.2f funding=%.2f",
+             s["trades"], s["win_rate"] * 100, s["net_pnl"], s["return_pct"] * 100,
+             f"{s['profit_factor']:.2f}" if s["profit_factor"] else "n/a",
+             s["max_drawdown"] * 100, s["total_fees"], s["total_funding"])
+    log.info("=== Этап 5 завершён ✔ ===")
+    return 0
+
+
+def _synthetic_backtest_series(FeatureSnapshot, Bar):
+    """Детерминированная серия для офлайн-бэктеста: чередование побед и убытков."""
+    def enter_long(ts):
+        return FeatureSnapshot(
+            price=100.0, ts=ts, ema_fast=110.0, ema_slow=100.0, adx=30.0,
+            osc=35.0, osc_prev=28.0, macd_hist=0.5, macd_hist_prev=0.2,
+            bull_pattern=True, at_swing_low=True, volume=150.0, volume_avg=100.0,
+            atr=1.0, obi=0.3, cvd_delta=1.2, funding_rate=0.0001)
+
+    flat = FeatureSnapshot(price=100.0, ts=0, ema_fast=100.0, ema_slow=100.0, adx=10.0)
+    series = []
+    ts = 0
+    # 8 циклов: 5 выигрышных (пробой тейка), 3 убыточных (пробой стопа).
+    wins_pattern = [True, True, False, True, True, False, True, False]
+    for win in wins_pattern:
+        series.append((Bar(ts=ts, open=100, high=100.5, low=99.8, close=100.0),
+                       enter_long(ts)))
+        ts += 1
+        if win:
+            series.append((Bar(ts=ts, open=100, high=105.0, low=100.0, close=104.0), flat))
+        else:
+            series.append((Bar(ts=ts, open=100, high=100.1, low=95.0, close=96.0), flat))
+        ts += 1
+    return series
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trading Bot CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -454,6 +534,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Сколько свечей грузить на каждый TF (live)")
     p4.add_argument("--stoch-rsi", action="store_true",
                     help="Использовать Stoch RSI вместо RSI")
+
+    p5 = sub.add_parser("stage5", help="Backtester (прогон стратегии по истории)")
+    p5.add_argument("--offline", action="store_true",
+                    help="Синтетическая серия без сети")
+    p5.add_argument("--limit", type=int, default=800,
+                    help="Сколько свечей грузить на каждый TF (live)")
+    p5.add_argument("--stoch-rsi", action="store_true",
+                    help="Использовать Stoch RSI вместо RSI")
     return parser
 
 
@@ -475,6 +563,10 @@ def main(argv: list[str] | None = None) -> int:
                                 cvd_window_ms=args.cvd_window)
     if args.command == "stage4":
         return stage4_strategy(offline=args.offline,
+                               klines_limit=args.limit,
+                               use_stoch_rsi=args.stoch_rsi)
+    if args.command == "stage5":
+        return stage5_backtest(offline=args.offline,
                                klines_limit=args.limit,
                                use_stoch_rsi=args.stoch_rsi)
     return 2

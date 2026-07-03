@@ -53,6 +53,9 @@ class FeatureSnapshot:
     at_swing_high: bool = False
     volume: float = 0.0
     volume_avg: float = 0.0           # средний объём (подтверждение через OBV/объём)
+    atr: float = 0.0                  # ATR триггер-TF (для расчёта стопа/размера)
+    swing_low_price: Optional[float] = None   # последний подтверждённый swing low
+    swing_high_price: Optional[float] = None  # последний подтверждённый swing high
 
     # --- Микро-триггер (реал-тайм): стакан и поток сделок ---
     obi: Optional[float] = None       # Order Book Imbalance [-1..1]

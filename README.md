@@ -14,7 +14,7 @@
 | 2 | **Indicator Engine** (ADX, EMA, RSI/StochRSI, MACD, ATR, BB, OBV, VWAP, свечи, свинги) | ✅ реализован |
 | 3 | **Order Book Module** (OBI, стены, спред, CVD; WS + офлайн-реплей) | ✅ реализован |
 | 4 | **Strategy Module** (confluence-скоринг, сигналы в лог; Market Context) | ✅ реализован |
-| 5 | Backtester | ⏳ |
+| 5 | **Backtester** (та же Strategy; издержки, look-ahead-защита, метрики) | ✅ реализован |
 | 6 | Risk Manager | ⏳ |
 | 7 | Execution Engine | ⏳ |
 | 8 | Position Manager + синхронизация | ⏳ |
@@ -101,6 +101,21 @@ python -m trading_bot.main stage4 --limit 400
 одинаков в live и бэктесте; извлечение признаков из свечей (pandas) — тонкий
 адаптер `base_strategy.extract_features`. Market Context (`market_context/`:
 funding, open interest, long/short ratio) — REST-обёртки с инъектируемым клиентом.
+
+## Запуск — Этап 5 (Backtester)
+
+Прогон **той же** `BaseStrategy` по истории с обязательным учётом издержек
+(комиссии maker/taker + funding, раздел 7 ТЗ) и защитой от look-ahead: вход по
+close сигнального бара, проверка SL/TP — только со следующего бара.
+
+```bash
+python -m trading_bot.main stage5 --offline     # синтетика (без сети/pandas)
+python -m trading_bot.main stage5 --limit 800   # по живым klines
+```
+
+Движок работает на плоских `Bar`+`FeatureSnapshot` (stdlib); стоп/размер вынесены
+в инъектируемые функции (`default_sl_tp`/`default_sizing`) — на Этапе 6 их
+заменяет Risk Manager без переписывания движка.
 
 > **Опциональные зависимости.** `config/settings.py` и CLI написаны так, что
 > `stage3`/`stage4 --offline` работают без установленных `pandas`/`pybit`/
