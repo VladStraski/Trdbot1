@@ -779,6 +779,43 @@ def stage9_limits(offline: bool = False) -> int:
     return 0 if all_ok else 1
 
 
+def stage10_notifications(offline: bool = False) -> int:
+    """Этап 10: Notifications / мониторинг — веерная рассылка событий + heartbeat."""
+    from .notifications.monitor import Heartbeat, build_notifier
+    from .strategy.model import PointItem, Signal
+
+    settings = load_settings()
+    setup_logging(settings.log_dir, settings.log_level)
+    notifier = build_notifier(settings)
+    log.info("=== Этап 10: Notifications / мониторинг [%s] ===",
+             "OFFLINE" if offline else "LIVE-каналы")
+
+    # Пример событий по всему контуру.
+    sig = Signal(direction="long", score=8, threshold=6, entered=True,
+                 price=30_000.0, ts=1, breakdown=[PointItem("micro_bull", 2)],
+                 reason="скор 8 >= порога 6")
+    notifier.signal(sig)
+
+    class _Ord:  # лёгкий объект результата исполнения
+        ok, action, side, qty = True, "open", "Buy", 0.38
+    notifier.order(_Ord())
+
+    from .risk.portfolio_limits import BreakerEvent
+    notifier.breaker(BreakerEvent("max_drawdown", "просадка 16%", hard=True))
+    notifier.error("тестовая ошибка API")
+
+    # Heartbeat: свежесть контура данных.
+    hb = Heartbeat("data")
+    hb.beat(1_000)
+    fresh = not hb.is_stale(1_400, max_gap_ms=500)
+    stale = hb.is_stale(2_000, max_gap_ms=500)
+    log.info("Heartbeat: свежий@1400=%s, устарел@2000=%s", fresh, stale)
+
+    ok = fresh and stale
+    log.info("=== Этап 10: уведомления и heartbeat %s ===", "OK ✔" if ok else "ОШИБКА")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trading Bot CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -852,6 +889,10 @@ def build_parser() -> argparse.ArgumentParser:
     p9 = sub.add_parser("stage9", help="Portfolio limits / kill switch")
     p9.add_argument("--offline", action="store_true",
                     help="Демонстрация автостопов (сеть не требуется)")
+
+    p10 = sub.add_parser("stage10", help="Notifications / мониторинг")
+    p10.add_argument("--offline", action="store_true",
+                     help="Демонстрация уведомлений через лог-канал")
     return parser
 
 
@@ -889,6 +930,8 @@ def main(argv: list[str] | None = None) -> int:
                                reconcile_every=args.reconcile_every)
     if args.command == "stage9":
         return stage9_limits(offline=args.offline)
+    if args.command == "stage10":
+        return stage10_notifications(offline=args.offline)
     return 2
 
 

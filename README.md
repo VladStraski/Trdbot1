@@ -19,7 +19,7 @@
 | 7 | **Execution Engine** (demo-ордера, SL/TP reduce-only, dry-run) | ✅ реализован¹ |
 | 8 | **Position Manager** (WS-синхронизация + REST-сверка, backoff) | ✅ реализован¹ |
 | 9 | **Portfolio limits / kill switch** (circuit breakers, авто/ручной стоп) | ✅ реализован |
-| 10 | Notifications / мониторинг | ⏳ |
+| 10 | **Notifications / мониторинг** (веерная рассылка, Telegram, heartbeat) | ✅ реализован |
 
 ## Установка
 
@@ -171,9 +171,24 @@ python -m trading_bot.main stage8 --duration 30 --reconcile-every 5
 python -m trading_bot.main stage9 --offline
 ```
 
+## Запуск — Этап 10 (Notifications / мониторинг)
+
+Веерная рассылка событий (сигналы, ордера, circuit breakers, ошибки) по каналам:
+лог — всегда, Telegram — опционально (при заданных токене/chat_id). Heartbeat
+отслеживает свежесть контуров (основа авто-детекции зависания вместе с kill
+switch).
+
+```bash
+python -m trading_bot.main stage10 --offline
+```
+
+Каналы инъектируются (Telegram-транспорт — тоже), поэтому форматирование и логика
+тестируются офлайн без сети.
+
 > **Опциональные зависимости.** `config/settings.py` и CLI написаны так, что
-> `stage3`/`stage4 --offline` работают без установленных `pandas`/`pybit`/
-> `python-dotenv` — тяжёлые пакеты импортируются лениво там, где реально нужны.
+> офлайн-контур этапов 3–10 (`stageN --offline`) работает без установленных
+> `pandas`/`pybit`/`python-dotenv` — тяжёлые пакеты импортируются лениво там, где
+> реально нужны. Так проверяется вся логика в окружении без доступа к PyPI.
 
 ### ⚠️ Ограничение сетевой политики окружения
 
@@ -206,16 +221,30 @@ multi-TF агрегаторе, индикаторы, а также Order Book Mo
 
 ```
 trading_bot/
-├── config/       settings.py, .env.example (demo/prod ключи раздельно)
-├── data/         klines.py, multi_tf_aggregator.py, orderbook.py,
-│                 trades_stream.py, ws_public.py, stream_replay.py
-├── execution/    bybit_client.py (единый demo/prod интерфейс)
-├── storage/      models.py (SQLite: сделки, сигналы, equity)
-├── indicators/ market_context/ strategy/ risk/ backtest/ notifications/   # следующие этапы
-├── logger.py     структурированные логи (консоль + .jsonl)
-└── main.py       CLI
-tests/            офлайн-тесты
+├── config/          settings.py (dotenv опционален), .env.example (demo/prod)
+├── data/            klines, multi_tf_aggregator, orderbook, trades_stream,
+│                    ws_public, stream_replay
+├── indicators/      engine.py (EMA/RSI/MACD/ATR/ADX/BB/OBV/VWAP/свечи/свинги)
+├── market_context/  funding, open_interest, long_short_ratio
+├── strategy/        model, context_filter, signal_layer, trigger_layer,
+│                    confluence_scorer, base_strategy
+├── risk/            position_sizing, leverage_manager, stop_take_manager,
+│                    costs, risk_manager, portfolio_limits, kill_switch
+├── backtest/        engine.py, history.py
+├── execution/       bybit_client, execution_engine, position_manager, private_ws
+├── notifications/   telegram.py, monitor.py
+├── storage/         models.py (SQLite: сделки, сигналы, equity)
+├── reconnect.py     backoff-политика WS
+├── logger.py        структурированные логи (консоль + .jsonl)
+└── main.py          CLI: stage1..stage10
+tests/               офлайн-тесты (stdlib-контур работает без pandas/pybit)
 ```
+
+**Архитектурный принцип.** Логика отделена от транспорта и тяжёлых зависимостей:
+стратегия, риск, ордербук, CVD, бэктест, лимиты, уведомления работают на чистом
+stdlib и проверяются офлайн; pandas (индикаторы/адаптеры) и pybit (REST/WS)
+импортируются лениво только там, где реально нужны. Одна и та же логика стратегии
+и риска используется и в live, и в бэктесте.
 
 ## Безопасность
 
