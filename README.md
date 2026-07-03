@@ -16,7 +16,7 @@
 | 4 | **Strategy Module** (confluence-скоринг, сигналы в лог; Market Context) | ✅ реализован |
 | 5 | **Backtester** (та же Strategy; издержки, look-ahead-защита, метрики) | ✅ реализован |
 | 6 | **Risk Manager** (sizing, плечо от liq-safety, стоп/тейк, издержки в R:R) | ✅ реализован |
-| 7 | Execution Engine | ⏳ |
+| 7 | **Execution Engine** (demo-ордера, SL/TP reduce-only, dry-run) | ✅ реализован¹ |
 | 8 | Position Manager + синхронизация | ⏳ |
 | 9 | Portfolio limits / kill switch | ⏳ |
 | 10 | Notifications / мониторинг | ⏳ |
@@ -129,6 +129,24 @@ funding ≥ min_rr). Те же адаптеры (`as_sl_tp_fn`/`as_sizing_fn`) �
 python -m trading_bot.main stage6 --offline   # риск-решения + бэктест через RM
 python -m trading_bot.main stage6 --limit 800 # решение по живому equity/сигналу
 ```
+
+## Запуск — Этап 7 (Execution Engine)
+
+Превращает одобренное риск-решение в ордер через единый demo/prod клиент. Перед
+входом выставляются ISOLATED-маржа и плечо; SL и TP уходят на биржу **вместе с
+входом** как reduce-only (раздел 7 ТЗ) — не хранятся в памяти. Есть kill-switch
+(reduce-only закрытие) и dry-run.
+
+```bash
+python -m trading_bot.main stage7 --offline          # сухой прогон (без сети)
+python -m trading_bot.main stage7                     # live, но DRY-RUN (по умолч.)
+python -m trading_bot.main stage7 --execute           # РЕАЛЬНЫЕ ордера (только demo)
+```
+
+> ¹ **Live-долг.** Формирование ордеров покрыто офлайн-тестами с фейковым HTTP;
+> реальная отправка на Bybit Demo (`--execute`) требует доступа к
+> `api-demo.bybit.com`, закрытого текущей egress-политикой — проверяется в
+> сессии с открытым allowlist. Без `--execute` даже live-режим не шлёт ордера.
 
 > **Опциональные зависимости.** `config/settings.py` и CLI написаны так, что
 > `stage3`/`stage4 --offline` работают без установленных `pandas`/`pybit`/

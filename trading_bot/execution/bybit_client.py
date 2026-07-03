@@ -160,6 +160,134 @@ class BybitClient:
         ))
         return result.get("list", [])
 
+    # ------------------------------------------------------------------ #
+    #  Торговля (Этап 7). На demo ордера идут по REST (WS Trade API demo не
+    #  поддерживает, раздел 3 ТЗ). Числа Bybit ждёт строками.
+    # ------------------------------------------------------------------ #
+    def set_leverage(self, leverage: int, symbol: Optional[str] = None,
+                     category: Optional[str] = None) -> dict[str, Any]:
+        """Установить плечо (одинаковое buy/sell для isolated)."""
+        return self._unwrap(self._http.set_leverage(
+            category=category or self.settings.category,
+            symbol=symbol or self.settings.symbol,
+            buyLeverage=str(leverage),
+            sellLeverage=str(leverage),
+        ))
+
+    def set_margin_mode_isolated(self, leverage: int,
+                                 symbol: Optional[str] = None,
+                                 category: Optional[str] = None) -> dict[str, Any]:
+        """Переключить инструмент в ISOLATED-маржу с заданным плечом (раздел 3 ТЗ)."""
+        return self._unwrap(self._http.switch_margin_mode(
+            category=category or self.settings.category,
+            symbol=symbol or self.settings.symbol,
+            tradeMode=1,  # 1 = isolated
+            buyLeverage=str(leverage),
+            sellLeverage=str(leverage),
+        ))
+
+    def place_order(self, side: str, order_type: str, qty: float,
+                    price: Optional[float] = None, reduce_only: bool = False,
+                    stop_loss: Optional[float] = None,
+                    take_profit: Optional[float] = None,
+                    time_in_force: Optional[str] = None,
+                    position_idx: int = 0, symbol: Optional[str] = None,
+                    category: Optional[str] = None,
+                    order_link_id: Optional[str] = None) -> dict[str, Any]:
+        """Разместить ордер. SL/TP прикрепляются к позиции (reduce-only на бирже).
+
+        side — 'Buy'|'Sell'; order_type — 'Market'|'Limit'.
+        """
+        kwargs: dict[str, Any] = {
+            "category": category or self.settings.category,
+            "symbol": symbol or self.settings.symbol,
+            "side": side,
+            "orderType": order_type,
+            "qty": _fmt(qty),
+            "positionIdx": position_idx,
+        }
+        if price is not None:
+            kwargs["price"] = _fmt(price)
+        if reduce_only:
+            kwargs["reduceOnly"] = True
+        if stop_loss is not None:
+            kwargs["stopLoss"] = _fmt(stop_loss)
+        if take_profit is not None:
+            kwargs["takeProfit"] = _fmt(take_profit)
+        if time_in_force:
+            kwargs["timeInForce"] = time_in_force
+        if order_link_id:
+            kwargs["orderLinkId"] = order_link_id
+        return self._unwrap(self._http.place_order(**kwargs))
+
+    def amend_order(self, order_id: str, price: Optional[float] = None,
+                    qty: Optional[float] = None, stop_loss: Optional[float] = None,
+                    take_profit: Optional[float] = None,
+                    symbol: Optional[str] = None,
+                    category: Optional[str] = None) -> dict[str, Any]:
+        """Изменить активный ордер (цена/кол-во/SL/TP)."""
+        kwargs: dict[str, Any] = {
+            "category": category or self.settings.category,
+            "symbol": symbol or self.settings.symbol,
+            "orderId": order_id,
+        }
+        if price is not None:
+            kwargs["price"] = _fmt(price)
+        if qty is not None:
+            kwargs["qty"] = _fmt(qty)
+        if stop_loss is not None:
+            kwargs["stopLoss"] = _fmt(stop_loss)
+        if take_profit is not None:
+            kwargs["takeProfit"] = _fmt(take_profit)
+        return self._unwrap(self._http.amend_order(**kwargs))
+
+    def cancel_order(self, order_id: str, symbol: Optional[str] = None,
+                     category: Optional[str] = None) -> dict[str, Any]:
+        return self._unwrap(self._http.cancel_order(
+            category=category or self.settings.category,
+            symbol=symbol or self.settings.symbol,
+            orderId=order_id,
+        ))
+
+    def cancel_all(self, symbol: Optional[str] = None,
+                   category: Optional[str] = None) -> dict[str, Any]:
+        return self._unwrap(self._http.cancel_all_orders(
+            category=category or self.settings.category,
+            symbol=symbol or self.settings.symbol,
+        ))
+
+    def set_trading_stop(self, stop_loss: Optional[float] = None,
+                         take_profit: Optional[float] = None,
+                         position_idx: int = 0, symbol: Optional[str] = None,
+                         category: Optional[str] = None) -> dict[str, Any]:
+        """Выставить/переставить SL/TP на ОТКРЫТОЙ позиции (reduce-only на бирже)."""
+        kwargs: dict[str, Any] = {
+            "category": category or self.settings.category,
+            "symbol": symbol or self.settings.symbol,
+            "positionIdx": position_idx,
+        }
+        if stop_loss is not None:
+            kwargs["stopLoss"] = _fmt(stop_loss)
+        if take_profit is not None:
+            kwargs["takeProfit"] = _fmt(take_profit)
+        return self._unwrap(self._http.set_trading_stop(**kwargs))
+
+    def get_positions(self, symbol: Optional[str] = None,
+                      category: Optional[str] = None) -> list[dict[str, Any]]:
+        result = self._unwrap(self._http.get_positions(
+            category=category or self.settings.category,
+            symbol=symbol or self.settings.symbol,
+        ))
+        return result.get("list", [])
+
+    def get_open_orders(self, symbol: Optional[str] = None,
+                        category: Optional[str] = None) -> list[dict[str, Any]]:
+        result = self._unwrap(self._http.get_open_orders(
+            category=category or self.settings.category,
+            symbol=symbol or self.settings.symbol,
+        ))
+        return result.get("list", [])
+
     def ping(self) -> bool:
         """Быстрая проверка доступности API (server time)."""
         try:
@@ -168,3 +296,9 @@ class BybitClient:
         except Exception as exc:  # noqa: BLE001 - диагностический ping
             log.warning("ping() не удался: %s", exc)
             return False
+
+
+def _fmt(value: float) -> str:
+    """Число -> строка для Bybit без экспоненты и лишних нулей."""
+    s = f"{float(value):.8f}".rstrip("0").rstrip(".")
+    return s if s not in ("", "-0") else "0"

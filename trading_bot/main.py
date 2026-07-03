@@ -573,6 +573,81 @@ def stage6_risk(offline: bool = False, klines_limit: int = 800) -> int:
     return 0
 
 
+def stage7_execution(offline: bool = False, execute: bool = False,
+                     klines_limit: int = 400) -> int:
+    """Этап 7: Execution Engine — превращение решения в биржевой ордер.
+
+    offline=True — «сухой» прогон формирования ордеров (вход с SL/TP, закрытие
+    reduce-only, отмена) без сети/ключей.
+    offline=False — реальный demo-контур. БЕЗ --execute работает в dry-run (только
+    показывает намерение) — реальные ордера уходят лишь с явным --execute (раздел
+    10 ТЗ: никакой торговли до проверок).
+    """
+    from .execution.execution_engine import ExecutionEngine
+    from .risk.risk_manager import RiskManager, RiskParams
+    from .strategy.model import LONG
+
+    settings = load_settings()
+    setup_logging(settings.log_dir, settings.log_level)
+    rm = RiskManager(RiskParams.from_settings(settings))
+    mode = "OFFLINE (dry-run)" if offline else "LIVE"
+    log.info("=== Этап 7: Execution Engine [%s] ===", mode)
+
+    if offline:
+        eng = ExecutionEngine(client=None, settings=settings, dry_run=True)
+        decision = rm.decide(LONG, entry=30_000.0, atr=150.0, equity=10_000.0)
+        log.info("Решение: %s qty=%.6f SL=%.2f TP=%.2f плечо=%dx",
+                 decision.direction, decision.qty, decision.stop, decision.take,
+                 decision.leverage)
+        r_open = eng.open_from_decision(decision)
+        r_close = eng.close_position(LONG, decision.qty)
+        r_cancel = eng.cancel_all()
+        ok = r_open.ok and r_close.ok and r_cancel.ok
+        log.info("=== Этап 7 (offline): dry-run open/close/cancel %s ===",
+                 "OK ✔" if ok else "ОШИБКА")
+        return 0 if ok else 1
+
+    # --- LIVE ---
+    from .execution.bybit_client import BybitClient
+    from .indicators.engine import IndicatorConfig, IndicatorEngine
+    from .strategy.base_strategy import BaseStrategy
+    from .strategy.model import ScoreConfig
+
+    if execute and settings.is_prod:
+        log.error("--execute в prod запрещён на этом этапе. Только demo.")
+        return 1
+    dry = not execute
+    client = BybitClient(settings)
+    equity = client.get_equity(coin="USDT")
+    log.info("Equity=%.2f USDT; режим ордеров: %s",
+             equity, "DRY-RUN" if dry else "РЕАЛЬНЫЕ ОРДЕРА (demo)")
+
+    agg = _populate_aggregator(settings, klines_limit, offline=False)
+    if agg is None:
+        return 1
+    strategy = BaseStrategy(ScoreConfig(entry_threshold=settings.entry_score_threshold))
+    engine = IndicatorEngine(IndicatorConfig())
+    last = agg.latest(settings.tf_trigger, 1)
+    ref_time = int(last.iloc[0]["close_time"])
+    feat = strategy.extract_features(agg, engine, ref_time, settings.tf_context,
+                                     settings.tf_signal, settings.tf_trigger)
+    sig = strategy.evaluate(feat) if feat else None
+    if not (sig and sig.entered and sig.direction):
+        log.info("Нет сигнала на вход — ордера не требуются")
+        return 0
+    decision = rm.decide(sig.direction, feat.price, feat.atr, equity,
+                         swing_low=feat.swing_low_price,
+                         swing_high=feat.swing_high_price)
+    if not decision.approved:
+        log.info("Risk Manager отклонил вход: %s", decision.reason)
+        return 0
+    eng = ExecutionEngine(client, settings, dry_run=dry)
+    result = eng.open_from_decision(decision)
+    log.info("Результат исполнения: %s", result)
+    log.info("=== Этап 7 (live) завершён ✔ ===")
+    return 0 if result.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trading Bot CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -626,6 +701,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Демонстрация риск-решений без сети")
     p6.add_argument("--limit", type=int, default=800,
                     help="Сколько свечей грузить (live)")
+
+    p7 = sub.add_parser("stage7", help="Execution Engine (ордера на demo)")
+    p7.add_argument("--offline", action="store_true",
+                    help="Сухой прогон формирования ордеров без сети")
+    p7.add_argument("--execute", action="store_true",
+                    help="Отправлять РЕАЛЬНЫЕ ордера (только demo). Без флага — dry-run")
+    p7.add_argument("--limit", type=int, default=400,
+                    help="Сколько свечей грузить (live)")
     return parser
 
 
@@ -655,6 +738,9 @@ def main(argv: list[str] | None = None) -> int:
                                use_stoch_rsi=args.stoch_rsi)
     if args.command == "stage6":
         return stage6_risk(offline=args.offline, klines_limit=args.limit)
+    if args.command == "stage7":
+        return stage7_execution(offline=args.offline, execute=args.execute,
+                                klines_limit=args.limit)
     return 2
 
 
