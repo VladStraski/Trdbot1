@@ -1,12 +1,19 @@
 """Точка входа бота.
 
-На текущем шаге разработки реализован Этап 1 (Data Layer): проверка подключения
-к Bybit, загрузка klines по трём таймфреймам, наполнение multi-TF агрегатора и
-демонстрация корректного (без look-ahead) выравнивания старшего TF к младшему.
+Реализованные этапы (раздел 9 ТЗ):
+    Этап 1 — Data Layer: подключение к Bybit, klines по трём TF, multi-TF
+             агрегатор, выравнивание без look-ahead.
+    Этап 2 — Indicator Engine: расчёт индикаторов на исторических данных.
+    Этап 3 — Order Book Module: OBI, стены, спред и CVD (реал-тайм / офлайн-реплей).
 
 Запуск:
-    python -m trading_bot.main stage1              # health-check Этапа 1
-    python -m trading_bot.main stage1 --demo-funds # + пополнить демо-баланс
+    python -m trading_bot.main stage1 [--offline] [--demo-funds]
+    python -m trading_bot.main stage2 [--offline] [--stoch-rsi]
+    python -m trading_bot.main stage3 [--offline] [--duration N] [--depth 50]
+
+Публичные данные стакана/сделок (Этап 3) идут через общий стрим
+`stream.bybit.com` (mainnet = demo). REST-этапы (1–2) в live-режиме требуют
+доступа к `api-demo.bybit.com`; при закрытом доступе используйте `--offline`.
 """
 
 from __future__ import annotations
@@ -183,6 +190,115 @@ def stage2_indicators(klines_limit: int = 300, offline: bool = False,
     return 0
 
 
+def stage3_orderbook(offline: bool = False, duration: float = 15.0,
+                     depth: int = 50, obi_depth: int = 25,
+                     cvd_window_ms: int = 60_000,
+                     updates: int = 40) -> int:
+    """Этап 3: Order Book Module — OBI, стены, спред и CVD в реальном времени.
+
+    offline=True — проигрывание детерминированного синтетического потока
+    (snapshot + дельты стакана + publicTrade) через те же обработчики, что и
+    live-контур; проверяет всю логику без сети/pybit.
+
+    offline=False — подписка на публичный WS `orderbook.{depth}.{symbol}` и
+    `publicTrade.{symbol}` (общий стрим mainnet/demo, раздел 3 ТЗ) на `duration`
+    секунд, с периодическим снимком микро-контекста в лог.
+    """
+    from .data.orderbook import OrderBook
+    from .data.trades_stream import TradesStream
+
+    settings = load_settings()
+    setup_logging(settings.log_dir, settings.log_level)
+    mode = "OFFLINE (синтетика)" if offline else "LIVE (Bybit public WS)"
+    log.info("=== Этап 3: Order Book Module [%s] ===", mode)
+    log.info("symbol=%s depth=%d obi_depth=%d cvd_window=%dмс",
+             settings.symbol, depth, obi_depth, cvd_window_ms)
+
+    order_book = OrderBook(symbol=settings.symbol)
+    trades = TradesStream()
+
+    def _log_micro(tag: str) -> None:
+        ob_snap = order_book.snapshot(obi_depth=obi_depth)
+        tr_snap = trades.snapshot(window_ms=cvd_window_ms)
+        if not ob_snap["ready"] or ob_snap["mid"] is None:
+            log.info("[%s] стакан ещё не готов…", tag)
+            return
+        log.info(
+            "[%s] mid=%.2f spread=%.2f (%.2f bps) OBI=%+.3f | "
+            "CVD=%+.4f Δ=%+.4f trades=%d | стены=%d",
+            tag, ob_snap["mid"], ob_snap["spread"], ob_snap["spread_bps"],
+            ob_snap["obi"] if ob_snap["obi"] is not None else float("nan"),
+            tr_snap["cvd"], tr_snap["cvd_delta"], tr_snap["trade_count"],
+            len(ob_snap["walls"]),
+        )
+
+    if offline:
+        from .data.stream_replay import replay, synthetic_public_stream
+
+        messages = synthetic_public_stream(
+            symbol=settings.symbol, depth=depth, n_updates=updates)
+        # Периодический снимок по ходу проигрывания (каждые ~10 сообщений).
+        state = {"i": 0}
+
+        def _on_update(ob, tr, _msg) -> None:
+            state["i"] += 1
+            if state["i"] % 20 == 0:
+                _log_micro(f"replay#{state['i']}")
+
+        replay(messages, order_book, trades, on_update=_on_update)
+        _log_micro("итог")
+
+        # Санити-проверки корректности микро-триггеров.
+        snap = order_book.snapshot(obi_depth=obi_depth)
+        if not snap["ready"]:
+            log.error("Стакан не инициализирован снапшотом")
+            return 1
+        if snap["best_bid"] is None or snap["best_ask"] is None:
+            log.error("Нет лучших цен в стакане")
+            return 1
+        if snap["best_bid"] >= snap["best_ask"]:
+            log.error("LOOK/CROSS: best_bid >= best_ask (%.2f >= %.2f)",
+                      snap["best_bid"], snap["best_ask"])
+            return 1
+        log.info("=== Этап 3 (offline) завершён успешно ✔ ===")
+        return 0
+
+    # --- LIVE ---
+    from .data.ws_public import PublicWSFeed
+
+    feed = PublicWSFeed(
+        symbol=settings.symbol, depth=depth, category=settings.category,
+        on_orderbook=lambda ob, _m: None, on_trade=lambda tr, _m: None,
+    )
+    # Обработчики фида — те же экземпляры, что логируем.
+    feed.order_book = order_book
+    feed.trades = trades
+    try:
+        feed.start()
+    except ImportError:
+        log.error("pybit не установлен — live-режим недоступен. "
+                  "Используйте --offline или установите pybit.")
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        log.error("Не удалось открыть публичный WS: %s "
+                  "(домен stream.bybit.com может быть закрыт политикой) — "
+                  "используйте --offline", exc)
+        return 1
+
+    try:
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            time.sleep(1.0)
+            _log_micro("live")
+    except KeyboardInterrupt:
+        log.info("Прервано пользователем")
+    finally:
+        feed.stop()
+
+    log.info("=== Этап 3 (live) завершён ✔ ===")
+    return 0 if order_book.ready else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trading Bot CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -202,6 +318,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Прогон на синтетических данных без сети")
     p2.add_argument("--stoch-rsi", action="store_true",
                     help="Использовать Stoch RSI вместо RSI")
+
+    p3 = sub.add_parser("stage3", help="Order Book Module (OBI, стены, спред, CVD)")
+    p3.add_argument("--offline", action="store_true",
+                    help="Проигрывание синтетического потока без сети")
+    p3.add_argument("--duration", type=float, default=15.0,
+                    help="Длительность live-подписки в секундах")
+    p3.add_argument("--depth", type=int, default=50,
+                    help="Глубина стакана (1/50/200/500)")
+    p3.add_argument("--obi-depth", type=int, default=25,
+                    help="Сколько уровней брать для расчёта OBI")
+    p3.add_argument("--cvd-window", type=int, default=60_000,
+                    help="Окно расчёта дельты CVD, мс")
     return parser
 
 
@@ -215,6 +343,12 @@ def main(argv: list[str] | None = None) -> int:
         return stage2_indicators(klines_limit=args.limit,
                                  offline=args.offline,
                                  use_stoch_rsi=args.stoch_rsi)
+    if args.command == "stage3":
+        return stage3_orderbook(offline=args.offline,
+                                duration=args.duration,
+                                depth=args.depth,
+                                obi_depth=args.obi_depth,
+                                cvd_window_ms=args.cvd_window)
     return 2
 
 

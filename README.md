@@ -12,7 +12,7 @@
 |---|---|---|
 | 1 | **Data Layer** (Bybit-клиент, klines, multi-TF агрегатор, storage) | ✅ реализован |
 | 2 | **Indicator Engine** (ADX, EMA, RSI/StochRSI, MACD, ATR, BB, OBV, VWAP, свечи, свинги) | ✅ реализован |
-| 3 | Order Book Module | ⏳ |
+| 3 | **Order Book Module** (OBI, стены, спред, CVD; WS + офлайн-реплей) | ✅ реализован |
 | 4 | Strategy Module (confluence) | ⏳ |
 | 5 | Backtester | ⏳ |
 | 6 | Risk Manager | ⏳ |
@@ -64,13 +64,39 @@ python -m trading_bot.main stage2 --offline --stoch-rsi   # Stoch RSI вмест
 Индикаторы каузальны (значение бара i зависит только от баров ≤ i);
 `swing_high/low` возвращают только подтверждённые экстремумы — без look-ahead.
 
+## Запуск — Этап 3 (Order Book Module)
+
+Реал-тайм микро-триггеры (раздел 5 ТЗ): **OBI** (Order Book Imbalance), **стены**
+(крупные заявки), **спред** по стакану `orderbook.{depth}.{symbol}` и **CVD**
+(Cumulative Volume Delta) по потоку сделок `publicTrade.{symbol}`.
+
+```bash
+# Живой прогон: публичный WS stream.bybit.com (общий для mainnet и demo):
+python -m trading_bot.main stage3 --duration 20 --depth 50
+
+# Офлайн: проигрывание детерминированного синтетического потока (без сети),
+# через те же обработчики, что и live-контур:
+python -m trading_bot.main stage3 --offline
+```
+
+Транспорт (`data/ws_public.py`, pybit) отделён от обработчиков
+(`data/orderbook.py`, `data/trades_stream.py` — чистый stdlib), поэтому вся
+логика проверяется офлайн проигрыванием потока (`data/stream_replay.py`), без
+сети и без pandas/pybit.
+
 ### ⚠️ Ограничение сетевой политики окружения
 
-В managed-окружении Claude Code исходящий трафик к `bybit.com` (и demo, и
-mainnet) блокируется прокси (403 на CONNECT). Поэтому **живой** прогон
-Этапа 1 и последующая проверка на demo-данных выполняются локально у
-пользователя или в окружении, где домен Bybit разрешён сетевой политикой.
-В managed-окружении для проверки логики используется `--offline`.
+В managed-окружении Claude Code исходящий трафик к Bybit фильтруется egress-
+прокси. Наблюдалось: REST-хосты `api.bybit.com` / `api-demo.bybit.com` и
+demo-WS `stream-demo.bybit.com` — **403 на CONNECT**; публичный WS
+`stream.bybit.com` — доступен. Поэтому:
+- **живой** прогон Этапов 1–2 (нужен REST) выполняется там, где домен Bybit
+  разрешён политикой; в managed-окружении — `--offline`;
+- **Этап 3** в live-режиме использует только `stream.bybit.com` (публичные
+  данные общие для mainnet/demo), а для проверки логики есть `--offline`.
+
+> При закрытом доступе к PyPI зависимости (`pandas`, `pybit`, `pytest`) не
+> устанавливаются — тогда доступен только stdlib-контур Этапа 3 и его тесты.
 
 ## Тесты
 
@@ -78,15 +104,20 @@ mainnet) блокируется прокси (403 на CONNECT). Поэтому 
 python -m pytest tests/ -q
 ```
 
-Офлайн-тесты покрывают нормализацию klines и защиту от look-ahead в
-multi-TF агрегаторе — не требуют сети и ключей.
+Офлайн-тесты покрывают нормализацию klines, защиту от look-ahead в
+multi-TF агрегаторе, индикаторы, а также Order Book Module (снапшот/дельта
+стакана, OBI, стены, спред, CVD) — не требуют сети и ключей.
+
+Тесты Этапа 3 (`tests/test_orderbook.py`, `tests/test_trades_stream.py`)
+опираются только на stdlib и проходят даже без установленных `pandas`/`pybit`.
 
 ## Структура
 
 ```
 trading_bot/
 ├── config/       settings.py, .env.example (demo/prod ключи раздельно)
-├── data/         klines.py, multi_tf_aggregator.py
+├── data/         klines.py, multi_tf_aggregator.py, orderbook.py,
+│                 trades_stream.py, ws_public.py, stream_replay.py
 ├── execution/    bybit_client.py (единый demo/prod интерфейс)
 ├── storage/      models.py (SQLite: сделки, сигналы, equity)
 ├── indicators/ market_context/ strategy/ risk/ backtest/ notifications/   # следующие этапы
